@@ -1,0 +1,50 @@
+name: Test and deploy home lab demo
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    # This runs on your own laptop while its self-hosted runner is online.
+    runs-on: self-hosted
+    steps:
+      - name: Check out the latest code
+        uses: actions/checkout@v7
+
+      - name: Validate Docker Compose configuration
+        shell: powershell
+        run: docker compose config --quiet
+
+      - name: Build the Docker image
+        shell: powershell
+        run: docker compose build
+
+      - name: Deploy the updated container
+        shell: powershell
+        run: docker compose up -d --no-build --remove-orphans
+
+      - name: Verify the website responds
+        shell: powershell
+        run: |
+          $healthy = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            try {
+              $response = Invoke-WebRequest -Uri 'http://localhost:8080' -TimeoutSec 3 -UseBasicParsing
+              if ($response.StatusCode -eq 200) {
+                $healthy = $true
+                break
+              }
+            } catch {
+              Start-Sleep -Seconds 1
+            }
+          }
+          if (-not $healthy) {
+            docker compose ps
+            docker compose logs --tail 100
+            throw 'Health check failed: website did not return HTTP 200.'
+          }
+          Write-Host 'Deployment successful: http://localhost:8080'
