@@ -1,103 +1,133 @@
-# Home Lab CI/CD Demo
+# Home Lab CI/CD — Advanced Upgrade
 
-A small static website that demonstrates this flow:
+This upgrade adds a realistic learning workflow to the original Windows + Docker Desktop demo:
 
-1. Edit `index.html` on your laptop.
-2. `git commit` and `git push` to GitHub's `main` branch.
-3. GitHub Actions runs on your self-hosted runner.
-4. The workflow validates Compose, rebuilds the Docker image, recreates the container, and checks the website returns HTTP 200.
-5. View the app at <http://localhost:8080>.
+1. **Automated tests** run before Docker is built. A failed test blocks deployment.
+2. **Immutable version tags** use `sha-<12-character-git-commit>` rather than overwriting one `latest` image tag.
+3. **Security checks** scan repository content for likely secrets and the built image for fixable CRITICAL package vulnerabilities using Trivy.
+4. **Health checks and rollback** verify the HTTP page, `/health`, expected release tag, and Docker's health status. If a new release fails and a previous local release exists, the deployment script tries to restore it.
+5. **Separate environments:** every push to `main` deploys to staging on port 8081. Production runs separately on port 8082 and is promoted manually from GitHub Actions.
+6. **Basic monitoring** polls staging and production HTTP status, response time and container state.
 
-This starter deploys locally to the same Windows machine that runs Docker Desktop. It is intentionally a first learning project—not a production deployment template.
+This is a local learning lab—not a production-ready deployment blueprint. The staging and production services both run on your laptop, and rollback relies on older image tags still being present in its Docker image store.
 
-## Requirements
+## Upgrade the project you already pushed
 
-- Windows 10/11 x64
-- Git for Windows
-- Docker Desktop using the WSL 2 backend, running Linux containers
-- A GitHub account and a **private** GitHub repository
+1. Keep your existing project folder and its `.git` directory. Do **not** delete `.git` and do not run `git init` again.
+2. Extract this ZIP into a temporary folder.
+3. Copy the extracted files and folders into your existing `homelab-cicd-demo` folder, allowing the supplied files to replace matching files. This bundle intentionally does not contain `.git`.
+4. Make sure Docker Desktop is running in Linux-container mode and that your self-hosted runner can use the same Docker engine.
+5. From your existing repository folder, open PowerShell and run:
 
-Install Docker Desktop: <https://docs.docker.com/desktop/setup/install/windows-install/>
-Install Git: <https://git-scm.com/download/win>
+   ```powershell
+   .\scripts\Test-Website.ps1
+   docker compose config --quiet
+   ```
 
-## 1. Test Docker locally first
+6. Commit and push the upgrade:
 
-Open PowerShell in this project folder and run:
+   ```powershell
+   git add .
+   git commit -m "Upgrade CI/CD with tests security and rollback"
+   git push
+   ```
 
-```powershell
-docker --version
-docker compose version
-docker compose up -d --build
+The current legacy demo on port 8080 is intentionally left alone. The upgraded workflow uses staging `http://localhost:8081` and production `http://localhost:8082` so you can compare them side-by-side safely.
+
+## What runs automatically on every push to `main`
+
+The self-hosted runner executes this pipeline:
+
+1. PowerShell source tests.
+2. Docker Compose configuration validation.
+3. Build a Docker image tagged like `homelab-cicd-demo-web:sha-0123456789ab`.
+4. Trivy source dependency/secret scan.
+5. Trivy image scan that blocks fixable CRITICAL vulnerability findings.
+6. Deploy to staging, then check the page, `/health`, release tag and Docker health status.
+7. If the new staging release fails its health checks, attempt to restore the previous successful local staging tag.
+
+The Trivy scanner image is pinned to version `0.76.0`. Its first invocation downloads the scanner and vulnerability database, so the first security scan may take longer than later runs. An image scan may block deployment if it detects a fixable CRITICAL finding; inspect the scan report instead of disabling the check blindly.
+
+This sample application is a static HTML page with no application package manager or third-party code libraries. The image scan covers OS/runtime packages in the Nginx base image; expand the dependency scan if you add npm, Python, .NET or other application dependencies.
+
+## Deploy to production manually
+
+After a push succeeds and staging works:
+
+1. Open the repository on GitHub → **Actions**.
+2. Select **Home Lab CI-CD (test, scan, stage, promote, rollback)**.
+3. Select **Run workflow**.
+4. Choose `production` as the target and run it.
+
+The workflow tests, builds and scans the selected commit again, then deploys it on port 8082. Staging remains on 8081. This is a manual promotion for practice; a real environment should also have production access controls and an approval policy.
+
+## Try proving the test gate works
+
+In `index.html`, temporarily change the title from:
+
+```html
+<title>Home Lab CI/CD Demo</title>
 ```
 
-Open <http://localhost:8080>. You should see the demo page.
+to:
 
-To stop the local demo before setting up automation:
-
-```powershell
-docker compose down
+```html
+<title>Intentionally broken title</title>
 ```
 
-## 2. Create an empty private GitHub repository
+Commit and push the change. The automated test should fail before image build/deployment, leaving the previously deployed staging version running. Then restore the original title, commit and push again.
 
-On GitHub, create a **private** repository named `homelab-cicd-demo`. Do not initialise it with a README, licence, or `.gitignore`, because this folder already contains those files.
+## Find your image versions and roll back production
 
-In PowerShell, from this project folder, run the following commands. Replace the URL with your own repository URL:
-
-```powershell
-git init
-git branch -M main
-git add .
-git commit -m "Create home lab CI/CD demo"
-git remote add origin https://github.com/YOUR-USERNAME/homelab-cicd-demo.git
-git push -u origin main
-```
-
-If the workflow appears as queued while no runner is online, that's expected. It will run when the runner connects.
-
-## 3. Register this computer as a GitHub Actions runner
-
-Keep the repository private and only run workflows you trust on this computer. A self-hosted runner can execute commands on your machine.
-
-1. Open your repository on GitHub.
-2. Go to **Settings → Actions → Runners → New self-hosted runner**.
-3. Choose **Windows** and **x64**.
-4. Follow the current commands shown by GitHub to download and configure the runner. Use a separate folder such as `C:\actions-runner`, not this project folder.
-5. When prompted, give the runner a useful name such as `homelab-laptop` and accept the default labels.
-6. For this first demo, run `run.cmd` interactively in PowerShell and leave that window open. Do not install it as a service yet.
-
-GitHub provides a short-lived registration token in its setup instructions. Do not share it or paste it into your repository. The runner must stay online, and Docker Desktop must be running.
-
-Official runner instructions: <https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/add-runners>
-
-## 4. Experience automated deployment
-
-1. Open `index.html` in an editor.
-2. Change `Release: v1 — my first automated deployment` to `Release: v2 — deployed by git push`.
-3. Save, then run:
+List image tags kept locally:
 
 ```powershell
-git add index.html
-git commit -m "Update homepage to release v2"
-git push
+docker image ls homelab-cicd-demo-web
 ```
 
-4. On GitHub, open the repository's **Actions** tab and watch the workflow run.
-5. When it turns green, refresh <http://localhost:8080> (use Ctrl+F5 if the page looks cached). The release text should say v2.
+Tags look like `sha-0123456789ab`. To roll production back:
 
-The workflow performs `docker compose build` and `docker compose up -d --no-build`; you do not manually run Docker commands after each push.
+1. Open **Actions → Home Lab CI-CD (test, scan, stage, promote, rollback) → Run workflow**.
+2. Choose `rollback-production`.
+3. Enter an existing image tag in `image_tag`, for example `sha-0123456789ab`.
+4. Run the workflow and confirm the health checks pass at `http://localhost:8082`.
 
-## Troubleshooting
+The rollback target must already exist in the local Docker image store on the runner. Avoid deleting older tags until you no longer need them. The app records the last successful tag in `%USERPROFILE%\.homelab-cicd-demo\deploy-state\` outside the Git workspace.
 
-- **`docker` is not recognised / cannot connect:** start Docker Desktop and wait until its engine is ready; re-run `docker info`.
-- **Workflow queued / no runner:** make sure `run.cmd` is running and the runner shows `Idle` in **Settings → Actions → Runners**.
-- **Port 8080 already in use:** change the left side of `8080:80` in `compose.yaml` (for example, `8081:80`) and also change the URL in the workflow and README.
-- **Container is running but the page isn't updated:** confirm your commit reached the `main` branch and the latest Actions run passed; then hard-refresh the page.
-- **Need to inspect logs:** run `docker compose ps` and `docker compose logs --tail 100` from the project folder.
+## Monitoring and troubleshooting
+
+Run a one-time status check:
+
+```powershell
+.\scripts\Monitor.ps1 -Once
+```
+
+Keep polling every five seconds:
+
+```powershell
+.\scripts\Monitor.ps1
+```
+
+Press `Ctrl+C` to stop. More useful checks:
+
+```powershell
+docker compose -p homelab-staging ps
+docker compose -p homelab-staging logs --tail 100
+docker compose -p homelab-production ps
+docker compose -p homelab-production logs --tail 100
+docker stats
+```
+
+- **Runner offline / workflow queued:** leave `C:\actions-runner\run.cmd` running, and keep Docker Desktop open.
+- **Secret scan flags a file:** inspect the path and remove secrets from the repository. Rotate a credential if it was ever committed; deleting a file in a later commit does not remove it from history.
+- **Image scan fails:** inspect the Trivy output. Update the vulnerable base/runtime package or image where appropriate and rerun the pipeline.
+- **Deployment health check fails:** the script displays recent Compose logs and attempts rollback. If rollback itself fails, inspect the named project's logs and container status.
+- **Port conflict:** this lab intentionally uses 8081 for staging and 8082 for production; the old demo can continue to use 8080.
 
 ## Safety notes
 
-- Use a private repository with only trusted collaborators. Never attach this runner to a public repository or allow untrusted pull-request workflows to execute on it.
-- Keep the runner online only while experimenting; stop it with Ctrl+C when you're finished.
-- Do not store passwords, access tokens, or other secrets in the repo.
-- This example is for learning. Real production deployment needs stronger isolation, access control, approvals, backups, observability, and a rollback plan.
+- Keep the repository private and do not run untrusted workflows on your self-hosted runner. Actions code can execute commands on your Windows account.
+- Do not commit tokens, passwords or private keys.
+- No app port is exposed publicly by this lab; the services listen on local host ports.
+- The scanner's policy here blocks fixable CRITICAL image findings, not every CVE. Review all findings and tune policy thoughtfully as you learn.
+- The `latest` image tag is not used for releases; commit-specific tags are intended to make versions identifiable and rollback-able.

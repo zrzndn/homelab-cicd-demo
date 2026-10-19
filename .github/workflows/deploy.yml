@@ -1,50 +1,132 @@
-name: Test and deploy home lab demo
+name: Home Lab CI-CD (test, scan, stage, promote, rollback)
 
 on:
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Staging runs on port 8081; production runs on port 8082; rollback selects an older local image tag.'
+        type: choice
+        required: true
+        default: staging
+        options:
+          - staging
+          - production
+          - rollback-production
+      image_tag:
+        description: 'For rollback only: an existing tag such as sha-0123456789ab'
+        required: false
+        type: string
 
 permissions:
   contents: read
 
 jobs:
   deploy:
-    # This runs on your own laptop while its self-hosted runner is online.
-    runs-on: self-hosted
+    # This lab runs on your own Windows runner. Docker Desktop must be running in Linux-container mode.
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 30
     steps:
-      - name: Check out the latest code
+      - name: Check out source
         uses: actions/checkout@v7
 
-      - name: Validate Docker Compose configuration
+      - name: Select target and immutable image tag
         shell: powershell
-        run: docker compose config --quiet
+        env:
+          REQUESTED_TARGET: ${{ inputs.target }}
+          REQUESTED_IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_EVENT_NAME -eq 'push') {
+            $target = 'staging'
+          } else {
+            $target = $env:REQUESTED_TARGET
+          }
+          if ([string]::IsNullOrWhiteSpace($target)) { $target = 'staging' }
 
-      - name: Build the Docker image
+          if ($target -eq 'rollback-production') {
+            $tag = $env:REQUESTED_IMAGE_TAG.Trim()
+            if ([string]::IsNullOrWhiteSpace($tag)) {
+              throw 'For rollback-production, enter an existing tag such as sha-0123456789ab in the image_tag field.'
+            }
+            if ($tag -notmatch '^sha-[0-9a-f]{7,40}$') {
+              throw 'Invalid image_tag. Expected sha- followed by 7 to 40 lowercase hexadecimal characters.'
+            }
+          } else {
+            $tag = 'sha-' + $env:GITHUB_SHA.Substring(0, 12).ToLowerInvariant()
+          }
+
+          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "TARGET=$target`nIMAGE_TAG=$tag`n", [System.Text.UTF8Encoding]::new($false))
+          Write-Host "Target: $target"
+          Write-Host "Image tag: $tag"
+
+      - name: Run automated source tests
+        if: ${{ github.event_name == 'push' || inputs.target != 'rollback-production' }}
         shell: powershell
-        run: docker compose build
+        run: .\scripts\Test-Website.ps1
 
-      - name: Deploy the updated container
-        shell: powershell
-        run: docker compose up -d --no-build --remove-orphans
-
-      - name: Verify the website responds
+      - name: Validate Docker Compose
+        if: ${{ github.event_name == 'push' || inputs.target != 'rollback-production' }}
         shell: powershell
         run: |
-          $healthy = $false
-          for ($i = 0; $i -lt 30; $i++) {
-            try {
-              $response = Invoke-WebRequest -Uri 'http://localhost:8080' -TimeoutSec 3 -UseBasicParsing
-              if ($response.StatusCode -eq 200) {
-                $healthy = $true
-                break
-              }
-            } catch {
-              Start-Sleep -Seconds 1
-            }
+          docker compose config --quiet
+          if ($LASTEXITCODE -ne 0) { throw 'Docker Compose configuration is invalid.' }
+
+      - name: Build a commit-tagged Docker image
+        if: ${{ github.event_name == 'push' || inputs.target != 'rollback-production' }}
+        shell: powershell
+        run: |
+          docker compose build
+          if ($LASTEXITCODE -ne 0) { throw 'Docker image build failed.' }
+          Write-Host "Built image: homelab-cicd-demo-web:$env:IMAGE_TAG"
+
+      - name: Scan source dependencies and repository for secrets
+        if: ${{ github.event_name == 'push' || inputs.target != 'rollback-production' }}
+        shell: powershell
+        run: |
+          $workspace = $env:GITHUB_WORKSPACE -replace '\\', '/'
+          docker run --rm -v "${workspace}:/src:ro" aquasec/trivy:0.76.0 fs --scanners vuln,secret --severity HIGH,CRITICAL --exit-code 1 --skip-dirs /src/.git --no-progress /src
+          if ($LASTEXITCODE -ne 0) { throw 'Secret scan failed or a HIGH/CRITICAL secret finding was reported. Review Trivy output before deploying.' }
+
+      - name: Scan built image for critical vulnerabilities
+        if: ${{ github.event_name == 'push' || inputs.target != 'rollback-production' }}
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $image = "homelab-cicd-demo-web:$env:IMAGE_TAG"
+          $archive = Join-Path $env:RUNNER_TEMP 'homelab-cicd-image.tar'
+          docker save $image -o $archive
+          if ($LASTEXITCODE -ne 0) { throw "Could not export image $image for scanning." }
+
+          try {
+            $scanMount = "$($env:RUNNER_TEMP):/scan:ro"
+            docker run --rm -v $scanMount aquasec/trivy:0.76.0 image --input /scan/homelab-cicd-image.tar --scanners vuln --severity CRITICAL --ignore-unfixed --exit-code 1 --no-progress
+            if ($LASTEXITCODE -ne 0) { throw 'Image scan failed or fixable CRITICAL vulnerabilities were found. Deployment is blocked.' }
+          } finally {
+            Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue
           }
-          if (-not $healthy) {
-            docker compose ps
-            docker compose logs --tail 100
-            throw 'Health check failed: website did not return HTTP 200.'
-          }
-          Write-Host 'Deployment successful: http://localhost:8080'
+
+      - name: Deploy and health-check staging or production
+        if: ${{ github.event_name == 'push' || inputs.target != 'rollback-production' }}
+        shell: powershell
+        run: .\scripts\Deploy.ps1 -Environment $env:TARGET -ImageTag $env:IMAGE_TAG
+
+      - name: Roll back production to an existing image tag
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.target == 'rollback-production' }}
+        shell: powershell
+        run: .\scripts\Deploy.ps1 -Environment production -ImageTag $env:IMAGE_TAG
+
+      - name: Job summary
+        if: always()
+        shell: powershell
+        run: |
+          @"
+          ## Home lab deployment
+
+          - Target: $env:TARGET
+          - Image tag: $env:IMAGE_TAG
+          - Staging URL: http://localhost:8081
+          - Production URL: http://localhost:8082
+          - Rollback state is stored outside the Git workspace under your Windows user profile.
+          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8

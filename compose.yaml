@@ -1,13 +1,15 @@
 services:
   web:
+    image: homelab-cicd-demo-web:${IMAGE_TAG:-dev}
     build:
       context: .
-    container_name: homelab-cicd-demo
+      args:
+        APP_VERSION: ${IMAGE_TAG:-dev}
     ports:
-      - "8080:80"
+      - "${WEB_PORT:-8081}:80"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1/"]
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1/health"]
       interval: 10s
       timeout: 3s
       retries: 3
